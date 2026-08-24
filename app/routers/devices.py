@@ -85,3 +85,33 @@ def update_device(
     db.commit()
     db.refresh(device)
     return device
+
+
+@router.delete("/{device_id}", status_code=status.HTTP_204_NO_CONTENT)
+def remove_device(
+    device_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """NEW: backs the app's "Remove device" action, matching the same
+    scope/ownership check as update_device above. Not in the assignment's
+    minimum API list, but needed so a user can unpair a device (e.g. to
+    pair a different one) rather than being stuck with the first device
+    they ever registered.
+
+    Device.readings has cascade="all, delete-orphan" (and the FK itself is
+    ondelete="CASCADE"), so this also removes that device's health_readings
+    - acceptable here since the device is gone from the user's account and
+    there is nothing meaningful to keep those rows attached to.
+    """
+    device = (
+        db.query(Device)
+        .filter(Device.id == device_id, Device.user_id == current_user.id)
+        .first()
+    )
+    if not device:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found")
+
+    db.delete(device)
+    db.commit()
+    return None

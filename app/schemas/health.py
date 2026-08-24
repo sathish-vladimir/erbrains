@@ -1,6 +1,6 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class HealthReadingCreate(BaseModel):
@@ -11,6 +11,18 @@ class HealthReadingCreate(BaseModel):
     steps: int | None = None
     battery: int | None = None
     recorded_at: datetime
+
+    @field_validator("recorded_at")
+    @classmethod
+    def _strip_tzinfo(cls, value: datetime) -> datetime:
+        """The Flutter client sends ISO-8601 timestamps with a 'Z' suffix,
+        which Pydantic parses as timezone-aware. The DB column is a plain
+        (naive) DATETIME, and MySQL/pymysql errors out (500) if handed a
+        tz-aware value. Normalize to naive UTC here so every write path
+        (single + batch) is safe."""
+        if value.tzinfo is not None:
+            value = value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
 
 
 class HealthReadingBatchCreate(BaseModel):

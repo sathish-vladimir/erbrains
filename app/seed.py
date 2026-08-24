@@ -2,11 +2,6 @@
 after a fresh install/migration - no manual API calls needed to populate
 products, and a ready-to-use demo login for the rest of the tables
 (devices, health_readings, cart_items, orders, order_items).
-
-Run directly with: python -m app.seed
-Also called automatically on app startup. Every function here is
-idempotent (safe to run repeatedly) - it checks for existing rows before
-inserting anything.
 """
 import random
 from datetime import datetime, timedelta, timezone
@@ -46,7 +41,6 @@ SAMPLE_PRODUCTS = [
     },
 ]
 
-# Matches the assignment PDF's dashboard example.
 DEMO_EMAIL = "demo@erbrains.com"
 DEMO_PASSWORD = "demo1234"
 DEMO_DEVICE_ID = "FITRING-DEMO-001"
@@ -65,7 +59,7 @@ def seed_products():
 
 def seed_demo_data():
     """Creates a demo user with a device, a history of health readings
-    (ending in the exact PDF dashboard values), one cart item, and one
+   one cart item, and one
     completed order - so devices/health_readings/cart_items/orders/
     order_items all have data to query right after setup, without having
     to drive the whole flow through Swagger by hand first.
@@ -95,7 +89,6 @@ def seed_demo_data():
 
         # ~3 days of readings (one every 2 hours) so /health/readings has
         # history to page through and /health/summary has something to
-        # average, ending in the exact values shown in the assignment PDF.
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         steps_so_far = 0
         for i in range(36, 0, -1):
@@ -113,7 +106,7 @@ def seed_demo_data():
                     recorded_at=recorded_at,
                 )
             )
-        # Final/current reading = the PDF's dashboard example exactly.
+        # Final/current reading.
         db.add(
             HealthReading(
                 client_reading_id="demo-seed-latest",
