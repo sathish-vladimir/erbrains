@@ -6,17 +6,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 
-from app.db.connection import init_db
+# from app.db.connection import init_db
 from app.routers import auth, cart, devices, health, orders, products
 from app.seed import seed_demo_data, seed_products
 
 
+# @asynccontextmanager
+# async def lifespan(app: FastAPI):
+#     # Dev convenience: create tables directly from models and seed sample
+#     init_db()
+#     seed_products()
+#     seed_demo_data()
+#     yield
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Dev convenience: create tables directly from models and seed sample
-    init_db()
-    seed_products()
-    seed_demo_data()
     yield
 
 
