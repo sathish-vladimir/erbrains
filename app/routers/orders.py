@@ -14,13 +14,7 @@ def place_order(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Places an order from whatever is currently in the user's cart.
-
-    Runs as a single DB transaction: stock is checked and decremented,
-    order + order_items are written, and the cart is cleared together, or
-    nothing is written at all if any step fails (e.g. insufficient stock).
-    No real payment gateway - see assignment scope note.
-    """
+ 
     cart_items = (
         db.query(CartItem)
         .options(joinedload(CartItem.product))
