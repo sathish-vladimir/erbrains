@@ -68,9 +68,7 @@ def update_device(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Extra endpoint (not in the spec's minimum list) used by the app to
-    push connection-status / battery changes as the wearable connects,
-    disconnects, and reconnects."""
+
     device = (
         db.query(Device)
         .filter(Device.id == device_id, Device.user_id == current_user.id)
@@ -93,17 +91,8 @@ def remove_device(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """NEW: backs the app's "Remove device" action, matching the same
-    scope/ownership check as update_device above. Not in the assignment's
-    minimum API list, but needed so a user can unpair a device (e.g. to
-    pair a different one) rather than being stuck with the first device
-    they ever registered.
 
-    Device.readings has cascade="all, delete-orphan" (and the FK itself is
-    ondelete="CASCADE"), so this also removes that device's health_readings
-    - acceptable here since the device is gone from the user's account and
-    there is nothing meaningful to keep those rows attached to.
-    """
+   
     device = (
         db.query(Device)
         .filter(Device.id == device_id, Device.user_id == current_user.id)
