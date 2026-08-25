@@ -1,305 +1,302 @@
-# ERBrains Assessment — Backend (FastAPI)
+# Wearable Health & Shopping App
 
-Backend for the "Wearable Health & Shopping" take-home assignment.
+A full-stack mobile assessment project: a **Flutter** app for a wearable health
+tracker (mock BLE device) with an integrated **product store**, backed by a
+**FastAPI** REST API with **JWT auth**, **Alembic** migrations, and a live
+**MySQL** database hosted on **Aiven**. The backend is deployed on **Render**.
 
-**Stack deviation from the brief:** the assignment suggests Node.js/NestJS +
-PostgreSQL. This implementation uses **FastAPI + SQLAlchemy + MySQL**
-instead. Reasoning: FastAPI/SQLAlchemy gives the same layered
-architecture (routers → schemas → models → DB) with less boilerplate,
-built-in OpenAPI docs, and native Pydantic validation, which was a better
-fit for a 72-hour scope. MySQL was chosen because it was already the
-target during local setup; the code has no MySQL-specific SQL (plain
-SQLAlchemy ORM), so switching `DATABASE_URL` to Postgres works with no
-code changes — only the driver (`psycopg2`) needs to be swapped in.
-
----
-
-## 1. Architecture
-
-```
-Flutter app
-    |
-    v
-FastAPI routers (app/routers/*)      <- HTTP layer, one file per resource
-    |
-    v
-Pydantic schemas (app/schemas/*)     <- request/response validation & shape
-    |
-    v
-SQLAlchemy models (app/db/model.py)  <- ORM layer, one class per table
-    |
-    v
-MySQL (or any SQL DB via DATABASE_URL)
-```
-
-- **`app/main.py`** — creates the FastAPI app, wires CORS, mounts routers, runs `init_db()`/seed on startup.
-- **`app/core/config.py`** — reads `.env` into a single `settings` object.
-- **`app/core/security.py`** — password hashing (bcrypt) + JWT issue/verify.
-- **`app/deps.py`** — `get_current_user` dependency, used by every protected route.
-- **`app/db/connection.py`** — SQLAlchemy engine/session/Base.
-- **`app/db/model.py`** — all 7 tables (users, devices, health_readings, products, cart_items, orders, order_items).
-- **`app/schemas/*.py`** — Pydantic request/response models, one file per domain.
-- **`app/routers/*.py`** — one router per resource (auth, devices, health, products, cart, orders).
-- **`app/seed.py`** — inserts sample products on first run so `GET /products` isn't empty.
-- **`alembic/`** — versioned schema migrations (see §5).
-- **`tests/`** — pytest suite against an isolated SQLite file, no live DB needed.
-
-This mirrors the mobile-side separation the assignment asks for
-(Flutter → Wearable Service interface → Mock implementation): each layer
-here only talks to the layer directly below it, so e.g. swapping MySQL
-for Postgres, or SQLAlchemy for another ORM, wouldn't touch the routers.
+| Layer      | Stack                                                              |
+|------------|---------------------------------------------------------------------|
+| Mobile     | Flutter, Riverpod, Dio, SQLite (sqflite), fl_chart                 |
+| Backend    | FastAPI, SQLAlchemy 2.0, Alembic, JWT (python-jose), bcrypt         |
+| Database   | MySQL (Aiven, managed/cloud)                                        |
+| Hosting    | Render (Web Service) — backend, `https://erbrains.onrender.com`     |
 
 ---
 
-## 2. Setup & run (local)
+## Table of Contents
 
-### Prerequisites
-- Python 3.11+
-- A running MySQL 8 server
+- [Architecture Overview](#architecture-overview)
+- [Backend (FastAPI)](#backend-fastapi)
+  - [Project Structure](#backend-project-structure)
+  - [Database Schema](#database-schema)
+  - [Migrations (Alembic)](#migrations-alembic)
+  - [Authentication](#authentication)
+  - [API Endpoints](#api-endpoints)
+  - [Local Setup](#backend-local-setup)
+  - [Deployment (Render + Aiven)](#deployment-render--aiven)
+- [Mobile App (Flutter)](#mobile-app-flutter)
+  - [Project Structure](#flutter-project-structure)
+  - [State Management (Riverpod)](#state-management-riverpod)
+  - [Offline-First Storage & Sync](#offline-first-storage--sync)
+  - [Features](#features)
+  - [Local Setup](#flutter-local-setup)
+- [Demo Credentials](#demo-credentials)
 
-### Steps
+---
+
+## Architecture Overview
+
+```
+┌─────────────────────────┐         HTTPS / JSON        ┌──────────────────────────┐
+│        Flutter App      │ ───────────────────────────▶│      FastAPI Backend     │
+│  (Riverpod + SQLite)    │◀─────────────────────────── │   (Render Web Service)   │
+└─────────────────────────┘                              └──────────────────────────┘
+        │  local cache                                              │
+        ▼  (offline queue)                                          ▼
+┌─────────────────────────┐                              ┌──────────────────────────┐
+│   sqflite (on-device)   │                              │   MySQL on Aiven Cloud   │
+└─────────────────────────┘                              └──────────────────────────┘
+```
+
+- The wearable is **simulated** (`MockWearableService`) so the app can be
+  graded without real hardware. It streams heart rate / SpO₂ / step readings
+  on a timer and behaves like a real BLE integration point (connect,
+  disconnect, reconnect, random dropouts).
+- Every reading is written to **local SQLite first**. If the device is
+  online, it is pushed to the backend right after; if offline, it stays
+  queued locally (`synced = 0`) until connectivity returns, then a background
+  sync flushes the backlog in batches.
+- The backend exposes a small e-commerce module (products, cart, orders) in
+  addition to the health-tracking API, backed by the same MySQL database.
+
+---
+
+## Backend (FastAPI)
+
+### Backend Project Structure
+
+```
+app/
+├── main.py                 # FastAPI app, CORS, router registration, error handler
+├── deps.py                 # get_current_user() — JWT auth dependency
+├── seed.py                 # Seeds demo products + a demo user/device/history
+├── core/
+│   ├── config.py           # Reads DATABASE_URL / JWT_SECRET from .env
+│   └── security.py         # bcrypt hashing + JWT create/decode
+├── db/
+│   ├── connection.py       # SQLAlchemy engine, session, Base, init_db()
+│   └── model.py            # ORM models (User, Device, HealthReading, Product, CartItem, Order, OrderItem)
+├── routers/
+│   ├── auth.py              # /auth/register, /auth/login
+│   ├── devices.py           # /devices (CRUD for paired wearables)
+│   ├── health.py            # /health/readings, /health/readings/batch, /health/summary
+│   ├── products.py          # /products (public storefront listing)
+│   ├── cart.py               # /cart (add/update/remove)
+│   └── orders.py             # /orders (checkout, order history)
+└── schemas/                 # Pydantic request/response models, one file per domain
+
+alembic/
+├── env.py                   # Wires Alembic to the same DATABASE_URL as the app
+└── versions/
+    └── 8c82250066b3_initial_schema.py   # The one and only migration so far — creates all 7 tables
+```
+
+### Database Schema
+
+| Table            | Purpose                                                                 |
+|-------------------|--------------------------------------------------------------------------|
+| `users`           | Account, email (unique), bcrypt password hash                          |
+| `devices`         | A wearable paired to a user (`device_id` is the hardware/mock ID)      |
+| `health_readings` | Heart rate / SpO₂ / steps / battery per device, timestamped            |
+| `products`        | Storefront catalog                                                     |
+| `cart_items`      | One row per (user, product) — quantity                                 |
+| `orders`          | A checked-out cart, with a total and status                            |
+| `order_items`     | Line items of an order, price frozen at purchase time                  |
+
+Notable design choices:
+- `health_readings` has a **unique constraint on `(device_id, client_reading_id)`**.
+  The Flutter client generates a UUID for every reading before it's even
+  synced, so retrying a failed sync (e.g. after a dropped connection) never
+  creates duplicate rows on the server — the second insert is simply ignored.
+- `ix_health_readings_user_recorded` (composite index on `user_id, recorded_at`)
+  keeps the history/graph queries (`/health/readings`, `/health/summary`) fast
+  as the table grows.
+- All foreign keys use `ON DELETE CASCADE` so deleting a user/device cleans up
+  its dependent rows automatically.
+
+### Migrations (Alembic)
+
+This project uses **Alembic** for schema version control instead of relying
+on SQLAlchemy's `create_all()` in production.
+
+- **`alembic/env.py`** — configured to read the same `DATABASE_URL` the app
+  uses (from `.env`), so migrations always target the real database, not a
+  hardcoded one.
+- **`alembic/versions/8c82250066b3_initial_schema.py`** — the initial (and
+  currently only) migration. It creates all 7 tables above, in dependency
+  order, with their indexes, unique constraints, and foreign keys. This is
+  the file that was actually run against the live Aiven MySQL database.
+
+To apply migrations:
 
 ```bash
-# 1. Create the database
-mysql -u root -p -e "CREATE DATABASE assessment;"
+alembic upgrade head        # apply all pending migrations
+alembic downgrade -1        # roll back the last migration
+alembic revision --autogenerate -m "describe change"   # create a new migration after editing app/db/model.py
+```
 
-# 2. Configure environment
-cp .env.example .env
-# edit .env if your MySQL user/password/host differ
+> `app/db/connection.py::init_db()` still exists and can call `Base.metadata.create_all()`
+> for quick local prototyping, but the source of truth for any real
+> environment (including the live Render deployment) is `alembic upgrade head`.
 
-# 3. Install dependencies
-python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+### Authentication
+
+- `POST /auth/register` — creates a user, hashes the password with **bcrypt**.
+- `POST /auth/login` — verifies the password and returns a **JWT access token**
+  (`HS256`, configurable expiry via `JWT_EXPIRE_MINUTES`, default 24h).
+- All protected routes read `Authorization: Bearer <token>` and resolve it to
+  the current `User` row via `app/deps.py::get_current_user`.
+
+### API Endpoints
+
+| Method | Path                     | Auth | Description                                        |
+|--------|--------------------------|------|------------------------------------------------------|
+| POST   | `/auth/register`         | –    | Create an account                                    |
+| POST   | `/auth/login`             | –    | Log in, get a JWT                                    |
+| GET    | `/health`                 | –    | Health check (uptime probe for Render)               |
+| POST   | `/devices`                 | ✅   | Register / re-link a wearable to the current user     |
+| GET    | `/devices`                 | ✅   | List the current user's devices                      |
+| PATCH  | `/devices/{id}`            | ✅   | Update battery / connection status / name             |
+| DELETE | `/devices/{id}`            | ✅   | Unpair a device                                       |
+| POST   | `/health/readings`         | ✅   | Push a single reading                                 |
+| POST   | `/health/readings/batch`   | ✅   | Push many queued readings at once (offline sync)      |
+| GET    | `/health/readings`         | ✅   | Paginated reading history, filterable by device/date  |
+| GET    | `/health/summary`          | ✅   | Aggregated avg HR / SpO₂ / total steps (daily/weekly) |
+| GET    | `/products`                 | –   | List products (public storefront)                    |
+| GET    | `/products/{id}`            | –   | Product detail                                        |
+| POST   | `/cart`                     | ✅   | Add a product to the cart                             |
+| GET    | `/cart`                     | ✅   | View cart + running total                             |
+| PATCH  | `/cart/{item_id}`           | ✅   | Change quantity                                        |
+| DELETE | `/cart/{item_id}`           | ✅   | Remove an item                                         |
+| POST   | `/orders`                    | ✅   | Checkout — turns the cart into an order, decrements stock |
+| GET    | `/orders`                    | ✅   | Order history                                          |
+
+Interactive docs are auto-generated by FastAPI at `/docs` (Swagger UI) and
+`/redoc` once the server is running.
+
+### Backend Local Setup
+
+```bash
+cd backend
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# 4. Apply migrations (creates all tables)
-alembic upgrade head
+# .env
+DATABASE_URL=mysql+pymysql://user:password@host:port/dbname
+JWT_SECRET=change-me
+JWT_EXPIRE_MINUTES=1440
 
-# 5. Run the API
+alembic upgrade head          # create all tables
+python -m app.seed            # optional: seed demo products + demo user
 uvicorn app.main:app --reload
 ```
 
-Open **http://127.0.0.1:8000/docs** for interactive Swagger docs (every
-endpoint below is documented and callable from there).
+### Deployment (Render + Aiven)
 
-On startup the app also seeds 4 sample products plus a demo user with
-data in every table, so you can test right away — see §9.
+- **Database:** a MySQL instance provisioned through the **Aiven console**.
+  The connection string (with SSL params as required by Aiven) is stored in
+  `DATABASE_URL` and never committed — it's injected as an environment
+  variable.
+- **API:** deployed as a **Render Web Service**, pointed at this GitHub repo.
+  Render builds the service, injects the same environment variables
+  (`DATABASE_URL`, `JWT_SECRET`, `JWT_EXPIRE_MINUTES`), and runs
+  `alembic upgrade head` before starting `uvicorn` so the live schema is
+  always in sync with the migration history.
+- The Flutter app's base URL points at the deployed instance:
+  `https://erbrains.onrender.com` (see `lib/core/constants/api_constants.dart`).
 
-> Note: `init_db()` (in `app/db/connection.py`) also runs on every
-> startup and will `CREATE TABLE IF NOT EXISTS` for convenience — but the
-> source of truth for schema changes is Alembic (§5), not this
-> auto-create. In a real deployment you'd rely on `alembic upgrade head`
-> alone (that's what the `Procfile` does — see §10).
+---
 
-### Run the tests
+## Mobile App (Flutter)
+
+### Flutter Project Structure
+
+Feature-first architecture — each feature owns its `data` (models, remote/
+local sources, repository) and `presentation` (view + Riverpod viewmodel):
+
+```
+lib/
+├── main.dart
+├── core/
+│   ├── network/          # Dio client + typed ApiException
+│   ├── storage/           # sqflite AppDatabase, SharedPreferences token storage
+│   ├── constants/          # API base URL & route paths
+│   ├── theme/
+│   └── utils/              # connectivity_provider (online/offline stream)
+├── features/
+│   ├── auth/                # login / register
+│   ├── device/               # pairing (mock BLE scan) + live dashboard
+│   ├── history/               # readings history + weekly/daily graphs (fl_chart)
+│   ├── shop/                   # products, cart, orders
+│   └── sync/                    # offline → online sync repository
+└── widgets/                     # shared UI (app scaffold/bottom nav)
+```
+
+### State Management (Riverpod)
+
+Every feature follows the same pattern:
+`View` → watches a `ViewModel` (a `StateNotifier`/`AsyncNotifier` provider) →
+which calls a `Repository` → which calls a `RemoteSource` (Dio/HTTP) and/or
+a `LocalSource` (sqflite). This keeps the UI free of business logic and
+makes each layer independently testable.
+
+### Offline-First Storage & Sync
+
+- **Local DB:** `sqflite` table `health_readings` with a `synced` flag and a
+  `UNIQUE` constraint on `reading_uid` (`deviceId + timestamp`), so writes
+  from the mock wearable are never lost even without a connection.
+- **Connectivity:** `connectivity_plus` exposes an `isOnlineProvider` the UI
+  and sync logic both watch.
+- **Sync flow** (`SyncRepository.syncPendingReadings`):
+  1. Read all rows where `synced = 0` from SQLite.
+  2. For each, look up the server-side numeric `device_id` (returned when the
+     device was registered via `POST /devices`).
+  3. Push it to `/health/readings`; only mark it `synced = 1` **after** a
+     confirmed success response — so a crash mid-sync never loses data or
+     silently drops a reading.
+  4. If a request fails for a connectivity reason, the batch stops early and
+     retries as a whole the next time sync runs, instead of hammering the API.
+
+### Features
+
+- **Auth** — register/login, JWT stored via `SharedPreferences`, attached
+  automatically to every request by a Dio interceptor.
+- **Device pairing** — mock BLE scan (`MockBleScanner`) lists nearby fake
+  devices; connecting starts a simulated reading stream with realistic
+  behavior (connect delay, ~10% connect failure, ~5% random mid-session
+  drop, auto-reconnect, battery drain over time).
+- **Dashboard** — live heart rate / SpO₂ / steps / battery cards, sourced
+  from the current wearable stream.
+- **History** — tabbed view of raw readings plus **daily/weekly graphs**
+  built with `fl_chart`, pulling aggregated data from `/health/summary`
+  and paginated detail from `/health/readings`.
+- **Shop** — product listing, product detail, cart (add/update/remove), and
+  checkout into an order, all backed by the live backend.
+
+### Flutter Local Setup
 
 ```bash
-pytest -v
+cd frontend   # wherever pubspec.yaml lives
+flutter pub get
+flutter run
 ```
 
-Tests run against a throwaway local SQLite file (`test_run.db`), not your
-MySQL database, so they're safe to run at any time.
+Update `lib/core/constants/api_constants.dart` if you're pointing at a
+different backend (e.g. `http://10.0.2.2:8000` for a local server on the
+Android emulator) instead of the live Render URL.
 
 ---
 
-## 3. API documentation
+## Demo Credentials
 
-All endpoints are also live at `/docs` (Swagger) and `/redoc`.
-Protected endpoints require `Authorization: Bearer <token>` from `/auth/login`.
+The backend can be seeded with a ready-to-use demo account (`python -m app.seed`):
 
-| Method | Path | Auth | Description |
-|---|---|---|---|
-| POST | `/auth/register` | – | Create a user *(extra — spec assumes a user already exists to log in)* |
-| POST | `/auth/login` | – | Returns a JWT |
-| POST | `/devices` | Y | Register/update a wearable device for the current user |
-| GET | `/devices` | Y | List current user's devices |
-| PATCH | `/devices/{id}` | Y | Update battery/connection status *(extra)* |
-| POST | `/health/readings` | Y | Store one reading (rejects duplicate `client_reading_id` per device) |
-| POST | `/health/readings/batch` | Y | Store many readings in one call — used by the offline sync queue *(extra, see §6)* |
-| GET | `/health/readings` | Y | Paginated reading history (`device_id`, `start`, `end`, `limit`, `offset`) |
-| GET | `/health/summary` | Y | Aggregated stats (`period=daily\|weekly`): avg HR, avg SpO2, total steps |
-| GET | `/products` | – | List products (public, storefront-style) |
-| GET | `/products/{id}` | – | Product detail |
-| POST | `/cart` | Y | Add a product to cart (merges quantity if already present) |
-| GET | `/cart` | Y | View cart + computed total |
-| PATCH | `/cart/{item_id}` | Y | Change quantity *(extra)* |
-| DELETE | `/cart/{item_id}` | Y | Remove item *(extra)* |
-| POST | `/orders` | Y | Place an order from the current cart (checks stock, decrements it, clears cart) |
-| GET | `/orders` | Y | Order history with line items |
-| GET | `/health` | – | Liveness check |
+| Field    | Value                 |
+|----------|------------------------|
+| Email    | `demo@erbrains.com`   |
+| Password | `demo1234`             |
 
----
-
-## 4. Database design
-
-```
-users --< devices --< health_readings
-  |                        (device_id, client_reading_id) UNIQUE
-  |--< cart_items >-- products
-  `--< orders --< order_items >-- products
-```
-
-- **users**: `id, email (unique), password_hash, full_name, created_at`
-- **devices**: `id, device_id (unique), user_id -> users, name, battery, connection_status, created_at`
-- **health_readings**: `id, client_reading_id, user_id -> users, device_id -> devices, heart_rate, spo2, steps, battery, recorded_at, created_at`
-  — `UNIQUE(device_id, client_reading_id)` is the duplicate-prevention mechanism for sync retries (see §6). Indexed on `(user_id, recorded_at)` for the History screen's date-range queries.
-- **products**: `id, name, description, price, stock, image_url, created_at`
-- **cart_items**: `id, user_id -> users, product_id -> products, quantity` — `UNIQUE(user_id, product_id)` so adding the same product twice increments quantity instead of creating a second row.
-- **orders**: `id, user_id -> users, status, total_amount, created_at`
-- **order_items**: `id, order_id -> orders, product_id -> products, quantity, unit_price` — price is copied at order time so historical orders aren't affected by later price changes.
-
-All foreign keys to `users`/`devices`/`orders` cascade on delete, so removing a user cleans up their devices, cart, orders, and readings.
-
----
-
-## 5. Migrations (Alembic)
-
-The project uses Alembic for versioned schema changes (not just
-`create_all`), so the schema history is explicit and reproducible. The
-initial migration (`alembic/versions/8c82250066b3_initial_schema.py`) is
-already included and creates all 7 tables.
-
-```bash
-# apply all migrations
-alembic upgrade head
-
-# after changing a model in app/db/model.py, generate the next migration
-alembic revision --autogenerate -m "describe the change"
-
-# review the generated file in alembic/versions/ before applying
-alembic upgrade head
-```
-
-`alembic/env.py` reads `DATABASE_URL` from the same `.env` as the app, so
-migrations always target whatever database the API itself is configured
-for.
-
----
-
-## 6. Wearable integration approach
-
-The assignment's mock-to-real replacement path maps onto this backend as follows — the backend never talks to a wearable directly, it only receives readings the Flutter app has already collected:
-
-```
-Flutter Application
-    |
-Wearable Service / Interface   (Dart abstract class, e.g. WearableService)
-    |
-Mock Wearable Implementation   (generates readings on a timer, for this assignment)
-    |                                    ^ same interface ^
-    |                          Real Implementation later: Platform Channels
-    |                          -> Native Bridge -> Android SDK (Kotlin) /
-    |                            iOS SDK (Swift) -> the actual smart ring
-    v
-POST /health/readings  or  POST /health/readings/batch
-```
-
-Recommended replacement approach: **Flutter Platform Channels**, wrapped
-behind the same `WearableService` interface the mock implements. This
-keeps the swap to a single class (`RealWearableService implements
-WearableService`) with zero changes to the rest of the app — UI, local
-storage, and sync logic all depend on the interface, not the
-implementation. A full native plugin package would only be worth the
-extra overhead if the wearable integration were being reused across
-multiple separate apps.
-
----
-
-## 7. Offline synchronisation approach
-
-```
-Wearable readings -> local storage (SQLite/Hive on device) -> Sync Queue -> this API
-```
-
-- The mobile app is expected to keep writing readings to local storage
-  regardless of connectivity, tagging each with a client-generated
-  `client_reading_id` (e.g. a UUID) at creation time — not at sync time.
-- When connectivity returns, the app flushes its queue via
-  **`POST /health/readings/batch`**, sending everything accumulated
-  while offline in one request (this directly covers the assignment's
-  100-readings-while-offline scenario).
-- **Duplicate prevention**: `health_readings` has
-  `UNIQUE(device_id, client_reading_id)`. If a batch (or a single
-  request) is retried after a timeout — where the server actually
-  received it but the client never got the response — the insert is
-  simply skipped instead of erroring the whole batch or creating a
-  duplicate row. `POST /health/readings/batch` reports
-  `{"created": [...], "duplicates_skipped": N}` so the app can safely
-  clear its local queue up to the last acknowledged reading either way.
-- **Retry after failure**: because readings are only removed from the
-  local queue after a successful (or duplicate-confirmed) server
-  response, a failed sync simply means "try again with the same queue
-  next time connectivity is available" — no readings are lost.
-
----
-
-## 8. Error handling
-
-- **Duplicate health readings** -> `409 Conflict` on the single endpoint; silently counted in `duplicates_skipped` on the batch endpoint (a batch is expected to contain retries, so it shouldn't fail as a whole).
-- **Auth failure** -> `401 Unauthorized` with `WWW-Authenticate: Bearer`; wrong password vs. unknown email are not distinguished in the response, to avoid leaking which emails are registered.
-- **Ownership checks** -> a device or reading that exists but belongs to another user returns `404`, not `403`, so as not to confirm the resource's existence to someone who doesn't own it.
-- **Validation errors** -> FastAPI/Pydantic auto-validates every request body; a custom exception handler in `main.py` flattens the response shape for easier parsing on the mobile side.
-- **Checkout guardrails**: empty cart -> `400`; insufficient stock for any item -> `400` and nothing is written (checked before any row is inserted/updated).
-- **Bluetooth/device disconnect and no-internet** are handled entirely client-side (this repo is the backend); the API's role is limited to accepting whatever the client eventually sends and being safe to retry against.
-
----
-
-## 9. Testing
-
-```bash
-pytest -v
-```
-
-Focused on the areas where incorrect behaviour would cause data loss or
-wrong business results, per the assignment's guidance (not aiming for 100%
-coverage):
-
-- `tests/test_health_readings.py` — single + batch ingestion, duplicate
-  rejection, the 100-readings offline-sync scenario (including a *second*
-  identical sync to prove it's idempotent), and cross-user device access.
-- `tests/test_cart_and_orders.py` — cart totals, quantity merging,
-  checkout decrementing stock and clearing the cart, and the two failure
-  paths (empty cart, insufficient stock) leaving state untouched.
-- `tests/test_auth.py` — register/login, duplicate email, wrong password, missing token.
-
----
-
-## 10. Deployment
-
-Deployed on **Railway** (railway.app) using Railway's native Python
-build (Nixpacks) — no Docker involved. Railway detects `requirements.txt`,
-installs dependencies, and runs the `Procfile`'s start command:
-
-```
-web: alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT
-```
-
-`$PORT` is set automatically by Railway; `alembic upgrade head` runs the
-migration before the server starts accepting traffic, every deploy.
-
-**Steps:**
-1. Push this project to a GitHub repo.
-2. On railway.app → New Project → Deploy from GitHub repo, select the repo.
-3. Add a MySQL database: same project → New → Database → Add MySQL.
-   Railway provisions it and exposes connection details as variables.
-4. On the API service → Variables tab, set:
-   - `DATABASE_URL` = `mysql+pymysql://<user>:<password>@<host>:<port>/<database>`
-     (build this from the MySQL service's connection variables Railway shows you)
-   - `JWT_SECRET` = a real random secret (not the local dev default)
-5. Railway builds and deploys automatically. Once live, `/docs` on the
-   generated `https://<your-app>.up.railway.app` URL should load Swagger,
-   same as local — that's the public URL the Flutter app points at.
-
-CORS is currently wide open (`allow_origins=["*"]`) for ease of
-development against an emulator/device — restrict this to the app's
-actual origin(s) before a production deployment.
-
----
-
-## 11. Major technical decisions & trade-offs
-
-- **FastAPI over NestJS**: faster to build correctly within 72 hours; trade-off is deviating from the suggested stack (documented above).
-- **JWT over session cookies**: simpler for a mobile client with no browser/cookie jar; trade-off is manual token expiry/refresh handling on the client (not implemented — tokens just expire after `JWT_EXPIRE_MINUTES`, no refresh-token flow, to keep scope in check).
-- **Batch sync endpoint added beyond the spec's minimum list**: sending 100 individual `POST /health/readings` calls after reconnecting is both slow and easy to get wrong (partial failures mid-loop); one batch call with per-row duplicate handling is simpler for the client and atomic-enough for this use case.
-- **Alembic in addition to `create_all`**: `create_all` is kept for local dev convenience (matches the original zip's behaviour), but Alembic is the real migration story — required for any environment where the schema needs to evolve without dropping data.
-- **No payment gateway**: out of scope per the assignment; `POST /orders` finalizes on stock + cart state only.
+This also seeds sample products, a paired demo device, ~3 days of health
+history, one cart item, and one completed order — so every screen has real
+data to show immediately.
